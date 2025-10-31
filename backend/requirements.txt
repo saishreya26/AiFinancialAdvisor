@@ -1,0 +1,3 @@
+flask
+flask-cors
+flask flask-cors yfinance scikit-learn pandas numpy
