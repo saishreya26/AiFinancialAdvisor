@@ -15,7 +15,6 @@ from news import fetch_gold_price_in_inr, fetch_silver_price_in_inr, convert_to_
 from flask_bcrypt import Bcrypt
 from dotenv import load_dotenv
 import  pandas as pd
-from recommendations import generate_recommendations, build_transaction_features, recommend_from_features
 from stock_utils import (
     fetch_stooq_data, search_mutual_fund,
     fetch_mutual_fund_data, create_features,
@@ -32,8 +31,33 @@ from cryptography.fernet import Fernet
 import os
 from bson.objectid import ObjectId
 from cryptography.fernet import Fernet
+import google.generativeai as genai
+from pathlib import Path
 
+# --- Load Environment Variables ---
 
+# 1. Define the base directory (where app.py lives: /backend)
+BASE_DIR = Path(__file__).resolve().parent
+
+# 2. Assume .env is in the project root (one level up: /AiFinn)
+dotenv_path = BASE_DIR.parent / '.env'
+
+# Use this specific path to load the environment variables
+if dotenv_path.exists():
+    load_dotenv(dotenv_path)
+    print(f"SUCCESS: Loaded .env from: {dotenv_path}")
+else:
+    # If this prints, the file isn't in the root either!
+    raise FileNotFoundError(f"CRITICAL ERROR: .env file not found at expected root location: {dotenv_path}")
+
+# Diagnostic check
+if not os.getenv("GEMINI_API_KEY"):
+    raise EnvironmentError("FATAL: GEMINI_API_KEY is still not set. Check content and variable name in .env.")
+else:
+    print("API Key check passed successfully. Importing modules...")
+# -----------------------------------------------------------------
+
+from recommendations import generate_recommendations, build_transaction_features, recommend_from_features
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -451,36 +475,46 @@ def health_check():
             "/api/health"
         ]
     })
-
-
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 @app.route("/api/chat", methods=["POST"])
 def chat():
     try:
         user_message = request.json.get("message")
+        # Extract the messages array for conversational context
         previous_messages = request.json.get("messages", [])
 
-        messages = previous_messages + [{"role": "user", "content": user_message}]
+        # The Gemini API often prefers a simplified history structure or role-based Parts
+        # For simplicity in the Flask wrapper, we'll continue using the combined text approach.
+        conversation = ""
+        for msg in previous_messages:
+            # We skip the initial "Hi! Ask me anything." assistant message to keep context clean
+            if msg.get("role") == "assistant" and msg.get("content").startswith("Hi!"):
+                continue
 
-        payload = {
-            "model": "llama3",  # or phi3, mistral, etc.
-            "messages": messages,
-            "stream": False
-        }
+            role = "User" if msg.get("role") == "user" else "Assistant"
+            content = msg.get("content", "")
+            conversation += f"{role}: {content}\n"
 
-        response = requests.post("http://localhost:11434/api/chat", json=payload)
-        response.raise_for_status()
+        # Add the current user message and prompt for the assistant's reply
+        conversation += f"User: {user_message}\nAssistant:"
 
-        res_data = response.json()
-        print("Ollama Response:", res_data)  # ✅ Add for debugging
+        # Use the correct, widely available model name
+        # FIX: Changed "gemini-1.5-flash" to "gemini-2.5-flash"
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
+        # Use generate_content
+        response = model.generate_content(conversation)
+
+        reply = response.text if response.text else "I seem to be having trouble processing that request."
 
         return jsonify({
-            "message": res_data["message"]["content"]
+            "message": reply
         })
 
     except Exception as e:
-        print("💥 Flask API Error:", e)
+        # Log the specific error for better debugging
+        print(f"💥 Flask API Error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/api/fire', methods=['POST'])
 def fire_calculator():

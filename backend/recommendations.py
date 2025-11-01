@@ -2,8 +2,19 @@ import pandas as pd
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-import numpy as np
-import ollama
+import requests
+import json
+import os
+
+
+# These variables now rely on load_dotenv() being called successfully in the main file (app.py)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found in environment variables. Did you run load_dotenv() in your main application file?")
+
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
 # --- Feature Engineering ---
 def build_transaction_features(txs: pd.DataFrame):
@@ -12,7 +23,7 @@ def build_transaction_features(txs: pd.DataFrame):
         return {}
 
     txs = txs.copy()
-    txs["date"] = pd.to_datetime(txs["date"], errors="coerce")  # ensure datetime
+    txs["date"] = pd.to_datetime(txs["date"], errors="coerce")
     txs = txs.dropna(subset=["date"])
     if txs.empty:
         return {}
@@ -119,10 +130,6 @@ def recommend_from_features(features, debts_df, assets_df, goals_df):
     return recs
 
 def generate_recommendations(user_data):
-    """
-    Use Ollama (local LLM) to generate personalized recommendations
-    based on user financial profile.
-    """
     try:
         features = user_data.get("features", {})
         rules = user_data.get("rules", [])
@@ -158,7 +165,7 @@ def generate_recommendations(user_data):
         {rules}
 
         🧩 TASK:
-        1. Summarize this user’s current financial health in plain English.
+        1. Summarize this user’s current financial health in plain English and do not include any currency symbol.
         2. Give 3 highly personalized actionable recommendations.
         3. Suggest 3 short-term and 3 long-term financial goals.
         4. Keep the tone friendly but professional.
@@ -170,22 +177,30 @@ def generate_recommendations(user_data):
         ## Long-term Goals
         """
 
-        response = ollama.chat(
-            model="llama3",
-            messages=[
-                {"role": "system", "content": "You are an expert financial advisor helping users plan smarter."},
-                {"role": "user", "content": prompt}
-            ]
-        )
+        system_instruction = "You are an expert financial advisor helping users plan smarter. Your output must ONLY be the requested markdown content."
 
-        # Safely extract LLM output
-        if "message" in response and "content" in response["message"]:
-            return response["message"]["content"]
-        elif "messages" in response and response["messages"]:
-            return response["messages"][-1].get("content", "")
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "systemInstruction": {"parts": [{"text": system_instruction}]}
+        }
+
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(
+            GEMINI_API_URL,
+            headers=headers,
+            data=json.dumps(payload)
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        candidate = result.get("candidates", [{}])[0]
+        generated_text = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
+
+        if generated_text:
+            return generated_text
         else:
             return "AI could not generate recommendations."
 
     except Exception as e:
-        print("Ollama generation error:", e)
+        print("Gemini generation error:", e)
         return "AI tips unavailable."
