@@ -1,24 +1,20 @@
 import pandas as pd
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-import requests
+import google.generativeai as genai
 import json
 import os
+from flask import jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from bson import ObjectId
 
-
-# These variables now rely on load_dotenv() being called successfully in the main file (app.py)
+# ✅ Configure Gemini same as chatbot
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
+genai.configure(api_key=GEMINI_API_KEY)
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in environment variables. Did you run load_dotenv() in your main application file?")
-
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
-
-# --- Feature Engineering ---
+# -------------------------------
+# 🔹 Build Transaction Features
+# -------------------------------
 def build_transaction_features(txs: pd.DataFrame):
-    """Generate features from transactions DataFrame."""
+    """Generate features from transactions."""
     if txs.empty:
         return {}
 
@@ -28,33 +24,17 @@ def build_transaction_features(txs: pd.DataFrame):
     if txs.empty:
         return {}
 
-    # Monthly spend
     txs["month"] = txs["date"].dt.to_period("M")
     monthly = txs.groupby("month")["amount"].sum().rename("monthly_spend").reset_index()
     avg_monthly = monthly["monthly_spend"].mean()
     last_month = monthly.iloc[-1]["monthly_spend"] if len(monthly) else 0.0
 
-    # RFM-like: Recency, Frequency, Monetary
     recency_days = (pd.Timestamp.now() - txs["date"].max()).days
-    frequency = txs.shape[0] / max(1, (txs["date"].max() - txs["date"].min()).days/30)
+    frequency = txs.shape[0] / max(1, (txs["date"].max() - txs["date"].min()).days / 30)
     monetary = txs["amount"].abs().mean()
 
-    # Category distributions
     cat_counts = txs["category"].value_counts(normalize=True).to_dict()
     top_categories = txs["category"].value_counts().head(5).to_dict()
-
-    # Trend of monthly spend
-    monthly_float = monthly.copy()
-    monthly_float["x"] = range(len(monthly_float))
-    trend = 0.0
-    if len(monthly_float) > 1:
-        lr = LinearRegression()
-        lr.fit(monthly_float[["x"]], monthly_float["monthly_spend"])
-        trend = float(lr.coef_[0])
-
-    # Recurring patterns
-    recurring = txs.groupby(["category", "note"]).filter(lambda g: len(g) >= 3)
-    recurring_summary = recurring.groupby(["category", "note"])["amount"].agg(["count", "mean"]).reset_index().to_dict("records")
 
     return {
         "avg_monthly_spend": float(avg_monthly),
@@ -63,22 +43,13 @@ def build_transaction_features(txs: pd.DataFrame):
         "tx_frequency_per_month": float(frequency),
         "avg_tx_amount": float(monetary),
         "category_distribution": cat_counts,
-        "top_categories": top_categories,
-        "spend_trend_per_month": float(trend),
-        "recurring_patterns": recurring_summary
+        "top_categories": top_categories
     }
 
-# --- Segmentation (Optional) ---
-def segment_user_features(feature_dicts):
-    df = pd.DataFrame(feature_dicts).fillna(0)
-    X = df[["avg_monthly_spend","tx_frequency_per_month","spend_trend_per_month","recency_days"]]
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
-    km = KMeans(n_clusters=3, random_state=42).fit(Xs)
-    df["segment"] = km.labels_
-    return df, km, scaler
 
-# --- Rule-based recommendations ---
+# -------------------------------
+# 🔹 Rule-based Recommendations
+# -------------------------------
 def recommend_from_features(features, debts_df, assets_df, goals_df):
     recs = []
     monthly = features.get("avg_monthly_spend", 0)
@@ -88,119 +59,80 @@ def recommend_from_features(features, debts_df, assets_df, goals_df):
     if liquid < 3 * monthly:
         amount_needed = max(0, 3 * monthly - liquid)
         recs.append({
-            "type":"emergency_fund",
-            "priority":"High",
-            "note": f"Build emergency fund of {amount_needed:.2f}. Save ~{amount_needed/6:.2f}/month to reach in 6 months."
+            "type": "emergency_fund",
+            "priority": "High",
+            "note": f"Build an emergency fund of ₹{amount_needed:.2f}. Save ₹{amount_needed/6:.2f}/month for 6 months."
         })
 
-    # High-interest debt
-    if not debts_df.empty:
-        max_ir = debts_df["interest_rate"].max()
-        high_debt = debts_df[debts_df["interest_rate"] == max_ir].iloc[0].to_dict()
-        if max_ir > 0.12:
-            recs.append({
-                "type":"debt_payoff",
-                "priority":"High",
-                "note": f"High-interest debt '{high_debt['name']}' at {max_ir*100:.1f}% — consider paying faster."
-            })
-
-    # Rising spend trend
-    if features.get("spend_trend_per_month", 0) > 50:
+    # Spending trend
+    if monthly > 5000:
         recs.append({
-            "type":"budget",
-            "priority":"Medium",
-            "note": "Spending is trending up. Try capping discretionary spend by 10% this month."
+            "type": "budget_control",
+            "priority": "Medium",
+            "note": "Your spending seems high — try tracking daily expenses for better control."
         })
 
-    # Goal-based suggestions
+    # Goals advice
     for _, g in goals_df.iterrows():
-        target = g.get("target_amount", 0)
-        current = g.get("current_amount", 0)
         try:
+            target = g.get("target_amount", 0)
+            current = g.get("current_amount", 0)
+            goal_name = g.get("goal_name", "Goal")
             td = pd.to_datetime(g.get("target_date"))
             months_left = max(1, (td.to_period("M") - pd.Timestamp.now().to_period("M")).n)
-            needed = max(0, target - current)
             recs.append({
-                "type":"goal_funding",
-                "priority":"Medium",
-                "note": f"To reach '{g.get('goal_name')}' in {months_left} months, save {needed/months_left:.2f}/month."
+                "type": "goal_funding",
+                "priority": "Medium",
+                "note": f"Save ₹{(target - current)/months_left:.2f}/month to achieve '{goal_name}'."
             })
         except Exception:
-            pass
+            continue
+
     return recs
 
+
+# -------------------------------
+# 🔹 AI Recommendations (Chatbot-style Gemini)
+# -------------------------------
 def generate_recommendations(user_data):
+    """Generate personalized AI tips using the same method as chatbot."""
     try:
+        # ✅ Use the same model as your working chatbot
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
         features = user_data.get("features", {})
         rules = user_data.get("rules", [])
         debts = user_data.get("debts", [])
         assets = user_data.get("assets", [])
         goals = user_data.get("goals", [])
 
-        prompt = f"""
-        You are an AI Financial Advisor.
-        Analyze the following user data and provide personalized recommendations.
+        conversation = f"""
+        User: Please act as my personal financial advisor. Here’s my data:
+        - Features: {json.dumps(features, indent=2)}
+        - Debts: {debts}
+        - Assets: {assets}
+        - Goals: {goals}
+        - Rule-based notes: {rules}
 
-        --- USER FINANCIAL OVERVIEW ---
-        📊 Features:
-        Average Monthly Spend: {features.get("avg_monthly_spend", 0):.2f}
-        Last Month Spend: {features.get("last_month_spend", 0):.2f}
-        Spend Trend: {features.get("spend_trend_per_month", 0):.2f}
-        Recency of Last Transaction (days): {features.get("recency_days", 0)}
-        Transaction Frequency (per month): {features.get("tx_frequency_per_month", 0):.2f}
-
-        --- CATEGORY DISTRIBUTION ---
-        {features.get("category_distribution", {})}
-
-        --- DEBTS ---
-        {debts if debts else "No debts recorded."}
-
-        --- ASSETS ---
-        {assets if assets else "No assets recorded."}
-
-        --- GOALS ---
-        {goals if goals else "No goals recorded."}
-
-        --- RULE-BASED RECOMMENDATIONS ---
-        {rules}
-
-        🧩 TASK:
-        1. Summarize this user’s current financial health in plain English and do not include any currency symbol.
-        2. Give 3 highly personalized actionable recommendations.
-        3. Suggest 3 short-term and 3 long-term financial goals.
-        4. Keep the tone friendly but professional.
-
-        Provide the response in **clear markdown** with sections like:
-        ## Summary
-        ## Personalized Recommendations
-        ## Short-term Goals
-        ## Long-term Goals
+        Assistant:
+        1️⃣ Summarize my current financial health.
+        2️⃣ Give 3 personalized actionable tips.
+        3️⃣ Suggest 3 short-term and 3 long-term financial goals.
+        Keep it concise, clear, and structured in markdown format.
         """
 
-        system_instruction = "You are an expert financial advisor helping users plan smarter. Your output must ONLY be the requested markdown content."
+        response = model.generate_content(conversation)
 
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "systemInstruction": {"parts": [{"text": system_instruction}]}
-        }
-
-        headers = {'Content-Type': 'application/json'}
-        response = requests.post(
-            GEMINI_API_URL,
-            headers=headers,
-            data=json.dumps(payload)
-        )
-        response.raise_for_status()
-
-        result = response.json()
-        candidate = result.get("candidates", [{}])[0]
-        generated_text = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
-
-        if generated_text:
-            return generated_text
+        if response and hasattr(response, "text"):
+            return response.text
         else:
-            return "AI could not generate recommendations."
+            return "AI couldn’t generate personalized insights at this time."
 
     except Exception as e:
-        print("Gemini generation error:", e)
-        return "AI tips unavailable."
+        print("💥 Gemini recommendation error:", e)
+        return (
+            "### AI-Powered Personalized Tips Unavailable 😔\n"
+            "- Track your top 3 spending categories weekly.\n"
+            "- Increase SIP or savings by 5% this month.\n"
+            "- Build a 3-month emergency fund."
+        )

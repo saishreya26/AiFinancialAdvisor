@@ -22,8 +22,8 @@ from stock_utils import (
 )
 from video_data import video_sections
 from financial_path import calculate_investment_recommendations, generate_description
-from utils.transactions import parse_google_pay_text, parse_uploaded_transactions
-from utils.categorizer import categorize_transaction
+from utils.transactions import parse_google_pay_text, parse_phonepe_pdf, format_date_safe,parse_uploaded_transactions
+from utils.categorizer import categorize_transaction, auto_category
 import smtplib, ssl
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from functools import wraps
@@ -33,6 +33,7 @@ from bson.objectid import ObjectId
 from cryptography.fernet import Fernet
 import google.generativeai as genai
 from pathlib import Path
+from bson.binary import Binary
 
 # --- Load Environment Variables ---
 
@@ -58,6 +59,26 @@ else:
 # -----------------------------------------------------------------
 
 from recommendations import generate_recommendations, build_transaction_features, recommend_from_features
+
+def safe_decrypt(value):
+    """Decrypt encrypted Mongo fields safely (supports Binary, bytes, and str)."""
+    if value is None:
+        return ""
+    try:
+        # If value is Binary or bytes (MongoDB)
+        if isinstance(value, (Binary, bytes)):
+            return cipher_suite.decrypt(bytes(value)).decode()
+        # If value is a string, try decrypting, else return as is
+        elif isinstance(value, str):
+            try:
+                return cipher_suite.decrypt(value.encode()).decode()
+            except Exception:
+                return value
+        return str(value)
+    except Exception:
+        return str(value)
+
+
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -117,6 +138,19 @@ def encrypt_field(value):
     if value is None:
         return None
     return cipher_suite.encrypt(str(value).encode())
+
+def decrypt_field(value):
+    """
+    Decrypt a Fernet-encrypted string value.
+    """
+    if value is None:
+        return None
+    try:
+        return cipher_suite.decrypt(value.encode()).decode()
+    except Exception:
+        # In case it's not encrypted or corrupted
+        return str(value)
+
 
 def send_email(receiver_email, otp):
     try:
@@ -233,6 +267,26 @@ def login():
 
     return jsonify({"message": "Invalid credentials"}), 401
 
+@app.route("/logout", methods=["POST"])
+@jwt_required()
+def logout():
+    # In a real system, you'd blacklist the token. For now, just return a success message.
+    return jsonify({"message": "Logout successful"}), 200
+
+@app.route("/forgot-password", methods=["POST"])
+def forgot_password():
+    data = request.get_json()
+    email = data.get("email")
+
+    user = users_collection.find_one({"email": email})
+    if not user:
+        return jsonify({"message": "User not found"}), 404
+
+    new_password = data.get("new_password")
+    hashed_pw = bcrypt.generate_password_hash(new_password).decode("utf-8")
+
+    users_collection.update_one({"email": email}, {"$set": {"password": hashed_pw}})
+    return jsonify({"message": "Password updated successfully"}), 200
 
 @app.route("/mydata", methods=["GET"])
 @jwt_required()
@@ -838,6 +892,55 @@ def add_goal():
 
     return jsonify({"message": f"Goal '{goal_name}' added successfully"}), 201
 
+@app.route("/users/goals/<goal_name>", methods=["PUT"])
+@jwt_required()
+def update_goal(goal_name):
+    user_id = get_jwt_identity()
+    data = request.json or {}
+
+    # Fetch user
+    user = users_collection.find_one({"_id": ObjectId(user_id)}, {"goals": 1})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    # Find the goal in user's goals array
+    goals = user.get("goals", [])
+    goal_to_update = next((g for g in goals if g["goal_name"] == goal_name), None)
+
+    if not goal_to_update:
+        return jsonify({"error": "Goal not found"}), 404
+
+    # Prepare updates
+    update_fields = {}
+
+    # Encrypt current_amount if provided
+    if "current_amount" in data:
+        try:
+            current_amount_str = str(float(data["current_amount"]))
+            encrypted_current_amount = cipher_suite.encrypt(current_amount_str.encode())
+            update_fields["goals.$.current_amount"] = encrypted_current_amount
+        except ValueError:
+            return jsonify({"error": "Invalid current_amount format"}), 400
+
+    # Update status if provided
+    if "status" in data:
+        update_fields["goals.$.status"] = data["status"]
+
+    if not update_fields:
+        return jsonify({"error": "No valid fields to update"}), 400
+
+    # Update the specific goal using positional operator
+    result = users_collection.update_one(
+        {"_id": ObjectId(user_id), "goals.goal_name": goal_name},
+        {"$set": update_fields}
+    )
+
+    if result.modified_count == 0:
+        return jsonify({"error": "Goal update failed"}), 500
+
+    return jsonify({"message": f"Goal '{goal_name}' updated successfully"}), 200
+
+
 # ---------------- Get Goals ----------------
 @app.route("/users/goals", methods=["GET"])
 @jwt_required()
@@ -971,19 +1074,32 @@ def add_transaction():
     user_id = get_jwt_identity()
     data = request.json or {}
 
-    if not data.get("category") or float(data.get("amount", 0)) <= 0:
-        return jsonify({"error": "Invalid input"}), 400
+    try:
+        amount = float(data.get("amount", 0))
+        if amount <= 0:
+            return jsonify({"error": "Invalid amount"}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid amount format"}), 400
+
+    # Default values
+    note = data.get("note", "")
+    category = data.get("category") or auto_category(note)
+    tx_type = data.get("type", "expense").lower()
 
     try:
-        encrypted_amount = encrypt_field(float(data.get("amount", 0)))
+        encrypted_amount = encrypt_field(amount)
         encrypted_date = encrypt_field(data.get("date", datetime.now().isoformat()))
-        encrypted_note = encrypt_field(data.get("note", ""))
+        encrypted_note = encrypt_field(note)
+        encrypted_category = encrypt_field(category)
+        encrypted_type = encrypt_field(tx_type)
     except Exception as e:
-        return jsonify({"error": "Invalid data format"}), 400
+        print("⚠️ Encryption error:", e)
+        return jsonify({"error": "Encryption failed"}), 500
 
     transaction = {
         "amount": encrypted_amount,
-        "category": data.get("category"),  # can encrypt if sensitive
+        "category": encrypted_category,
+        "type": encrypted_type,
         "date": encrypted_date,
         "note": encrypted_note
     }
@@ -994,27 +1110,105 @@ def add_transaction():
     )
 
     if result.modified_count == 0:
-        return jsonify({"error": "User not found or transaction not added"}), 404
+        return jsonify({"error": "User not found"}), 404
 
     return jsonify({"message": "Transaction added successfully"}), 201
 
+
+# ---------------- Add Investment ----------------
+@app.route("/users/investments", methods=["POST"])
+@jwt_required()
+def add_investment():
+    user_id = get_jwt_identity()
+    data = request.json or {}
+
+    # Validate required fields
+    if not data.get("category") or not data.get("name") or float(data.get("amount", 0)) <= 0:
+        return jsonify({"error": "Invalid or missing fields"}), 400
+
+    try:
+        encrypted_amount = encrypt_field(float(data.get("amount", 0)))
+        encrypted_returns = encrypt_field(float(data.get("returns", 0)))
+        encrypted_date = encrypt_field(data.get("date", datetime.now().isoformat()))
+        encrypted_name = encrypt_field(data.get("name"))
+    except Exception as e:
+        return jsonify({"error": "Invalid data format"}), 400
+
+    investment = {
+        "category": data.get("category"),  # SIP or Stock (optional to encrypt)
+        "name": encrypted_name,
+        "amount": encrypted_amount,
+        "returns": encrypted_returns,
+        "date": encrypted_date,
+        "created_at": encrypt_field(datetime.now().isoformat())
+    }
+
+    result = users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$push": {"investments": investment}}
+    )
+
+    if result.modified_count == 0:
+        return jsonify({"error": "User not found or investment not added"}), 404
+
+    return jsonify({"message": f"Investment '{data.get('name')}' added successfully"}), 201
+
+
+# ---------------- Get Investments ----------------
+@app.route("/users/investments", methods=["GET"])
+@jwt_required()
+def get_investments():
+    user_id = get_jwt_identity()
+    user = users_collection.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "investments": 1})
+
+    investments = user.get("investments", [])
+    for inv in investments:
+        try:
+            inv["name"] = cipher_suite.decrypt(inv["name"]).decode()
+            inv["amount"] = float(cipher_suite.decrypt(inv["amount"]).decode())
+            inv["returns"] = float(cipher_suite.decrypt(inv["returns"]).decode())
+            inv["date"] = cipher_suite.decrypt(inv["date"]).decode()
+            inv["created_at"] = cipher_suite.decrypt(inv["created_at"]).decode()
+        except Exception:
+            pass  # skip any decryption errors silently
+
+    return jsonify(investments)
+
+
 # ---------------- Get Transactions ----------------
+
 @app.route("/users/transactions", methods=["GET"])
 @jwt_required()
 def get_transactions():
     user_id = get_jwt_identity()
-    user = users_collection.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "transactions": 1})
+    transactions = fetch_user_transactions(user_id)
 
-    transactions = user.get("transactions", [])
+    # 🧹 Filter out invalid or missing fields before sending to frontend
+    cleaned = []
     for t in transactions:
         try:
-            t["amount"] = float(cipher_suite.decrypt(t["amount"]).decode())
-            t["date"] = cipher_suite.decrypt(t["date"]).decode()
-            t["note"] = cipher_suite.decrypt(t["note"]).decode()
-        except Exception:
-            pass  # skip if not encrypted
+            amount = float(t.get("amount", 0))
+            if not (0 < amount < 1e7):
+                continue  # skip unrealistic values
 
-    return jsonify(transactions)
+            date_str = t.get("date", "").strip()
+            if not date_str or "Invalid" in date_str or len(date_str) < 4:
+                continue  # skip invalid dates
+
+            # Ensure consistent output
+            cleaned.append({
+                "date": date_str,
+                "amount": amount,
+                "category": t.get("category", "Other"),
+                "note": t.get("note", t.get("description", "")),
+                "type": t.get("type", "N/A")
+            })
+        except Exception as e:
+            print("⚠️ Transaction filter error:", e)
+            continue
+
+    return jsonify(cleaned), 200
+
 
 # ---------------- Upload File ----------------
 @app.route("/users/upload", methods=["POST"])
@@ -1026,59 +1220,140 @@ def upload_file():
         return jsonify({"message": "No file part"}), 400
 
     file = request.files["file"]
-
     if file.filename == "":
         return jsonify({"message": "No selected file"}), 400
 
-    # Read file content
-    file_content = file.read()
+    filename = file.filename.lower()
 
-    # Parse transactions from file content
-    transactions = parse_uploaded_transactions(file_content)  # You need to implement this
+    # 🧠 Parse the file
+    if filename.endswith(".pdf"):
+        transactions = parse_phonepe_pdf(file)
+    else:
+        file_content = file.read()
+        transactions = parse_uploaded_transactions(file_content)
 
     stored_transactions = []
-    for t in transactions:
-        t = categorize_transaction(t)  # Auto-categorize (you can customize)
+    income_total = 0
+    expense_total = 0
+    category_summary = {}
 
+    for t in transactions:
         try:
-            encrypted_amount = encrypt_field(float(t.get("amount", 0)))
+            desc = t.get("description", "") or t.get("note", "")
+            amount_val = float(t.get("amount", 0))
+
+            if amount_val <= 0:
+                continue
+
+            # --- 🧠 Auto Categorize ---
+            category = auto_category(desc)
+
+            # --- 💰 Type Detection ---
+            if category.lower() == "income":
+                tx_type = "income"
+                income_total += amount_val
+            else:
+                tx_type = "expense"
+                expense_total += amount_val
+
+            print("🔍 NOTE TEXT:", desc)
+            print("➡ CATEGORY:", auto_category(desc))
+
+            # --- 📊 Category Summary (for chart) ---
+            category_summary[category] = category_summary.get(category, 0) + amount_val
+
+            # --- 🔐 Encrypt before storing ---
+            encrypted_amount = encrypt_field(amount_val)
             encrypted_date = encrypt_field(t.get("date", datetime.now().isoformat()))
-            encrypted_note = encrypt_field(t.get("note", ""))
+            encrypted_note = encrypt_field(desc)
+            encrypted_category = encrypt_field(category)
+            encrypted_type = encrypt_field(tx_type)
 
             transaction = {
                 "amount": encrypted_amount,
-                "category": t.get("category"),  # optionally encrypt
+                "category": encrypted_category,
+                "type": encrypted_type,
                 "date": encrypted_date,
                 "note": encrypted_note
             }
 
             users_collection.update_one(
-                {"_id": ObjectId(user_id)},
+                {"_id": ObjectId(str(user_id))},
                 {"$push": {"transactions": transaction}}
             )
-            stored_transactions.append(t)
+
+            stored_transactions.append({
+                "amount": amount_val,
+                "date": t.get("date", datetime.now().isoformat()),
+                "category": category,
+                "type": tx_type,
+                "note": desc
+            })
+
         except Exception as e:
-            continue  # skip invalid rows
+            print("⚠️ Error saving transaction:", e)
+            continue
+
+    # --- 📊 Summary Data for Charts ---
+    summary = {
+        "income": round(income_total, 2),
+        "expense": round(expense_total, 2),
+        "balance": round(income_total - expense_total, 2),
+        "categories": category_summary
+    }
 
     return jsonify({
-        "message": f"{len(stored_transactions)} transactions uploaded successfully",
-        "transactions": stored_transactions
+        "message": f"{len(stored_transactions)} transactions uploaded successfully ✅",
+        "transactions": stored_transactions,
+        "summary": summary
     }), 200
 
 
-#fetch user's details
 
-def fetch_transactions(user_id):
-    user = users_collection.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "transactions": 1})
-    transactions = user.get("transactions", [])
-    for t in transactions:
+#fetch user's details
+def fetch_user_transactions(user_id):
+    """Fetch and decrypt all user transactions safely."""
+    user = users_collection.find_one({"_id": ObjectId(str(user_id))})
+    if not user or "transactions" not in user:
+        return []
+
+    decrypted_transactions = []
+
+    for txn in user["transactions"]:
         try:
-            t["amount"] = float(cipher_suite.decrypt(t["amount"]).decode())
-            t["date"] = cipher_suite.decrypt(t["date"]).decode()
-            t["note"] = cipher_suite.decrypt(t["note"]).decode()
-        except Exception:
-            pass
-    return transactions
+            date = safe_decrypt(txn.get("date"))
+            amount_raw = safe_decrypt(txn.get("amount"))
+            note = safe_decrypt(txn.get("note"))
+            category = safe_decrypt(txn.get("category", "Other"))
+            tx_type = safe_decrypt(txn.get("type", "expense"))
+
+            # ✅ Clean and validate amount
+            amount_str = str(amount_raw).replace(",", "").strip()
+            # skip invalid or crazy values
+            if not amount_str.replace(".", "", 1).isdigit():
+                print(f"⚠️ Skipping invalid amount: {amount_str}")
+                continue
+
+            amount = float(amount_str)
+            if amount <= 0 or amount > 1e7:
+                continue
+
+            decrypted_transactions.append({
+                "date": date,
+                "amount": amount,
+                "note": note,
+                "category": category or "Other",
+                "type": tx_type or "expense"
+            })
+
+        except Exception as e:
+            print("⚠️ Decrypt error:", e)
+            continue
+
+    print("🔥 Decrypted Transactions:", decrypted_transactions)
+    return decrypted_transactions
+
+
 
 def fetch_assets(user_id):
     user = users_collection.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "assets": 1})
@@ -1121,24 +1396,18 @@ def fetch_goals(user_id):
 def get_recommendations():
     user_id = get_jwt_identity()
 
-    # --- Fetch user data ---
-    transactions = pd.DataFrame(fetch_transactions(user_id))
+    transactions = pd.DataFrame(fetch_user_transactions(user_id))
     assets = pd.DataFrame(fetch_assets(user_id))
     debts = pd.DataFrame(fetch_debts(user_id))
     goals = pd.DataFrame(fetch_goals(user_id))
 
-    # --- Ensure proper types ---
     if not transactions.empty and "date" in transactions.columns:
         transactions["date"] = pd.to_datetime(transactions["date"], errors="coerce")
         transactions = transactions.dropna(subset=["date"])
 
-    # --- Feature engineering ---
     features = build_transaction_features(transactions)
-
-    # --- Rule-based recommendations ---
     rules_recs = recommend_from_features(features, debts, assets, goals)
 
-    # --- AI personalized recommendations using Ollama ---
     ai_tips = generate_recommendations({
         "features": features,
         "rules": rules_recs,
@@ -1147,7 +1416,6 @@ def get_recommendations():
         "goals": goals.to_dict(orient="records")
     })
 
-    # --- Return combined response ---
     return jsonify({
         "rules_recommendations": rules_recs,
         "ai_tips": ai_tips,
@@ -1169,14 +1437,66 @@ def get_user_data(user_id):
 @app.route("/users/dashboard_summary", methods=["GET"])
 @jwt_required()
 def dashboard_summary():
-    """Optional endpoint to return all user data at once"""
+    """Return user data, transactions, and spending summary."""
     user_id = get_jwt_identity()
-    return jsonify({
-        "transactions": get_transactions().get_json(),
-        "assets": get_assets().get_json(),
-        "debts": get_debts().get_json(),
-        "goals": get_goals().get_json()
-    })
+    user = users_collection.find_one({"_id": ObjectId(str(user_id))}, {"name": 1, "_id": 0})
+
+    # Fetch all related data
+    transactions = fetch_user_transactions(user_id)
+    assets = fetch_assets(user_id)
+    debts = fetch_debts(user_id)
+    goals = fetch_goals(user_id)
+
+    # ✅ Compute category-wise spending (only expenses)
+    category_summary = {}
+    for txn in transactions:
+        try:
+            amt = txn.get("amount", 0)
+            if not isinstance(amt, (int, float)) or amt <= 0 or amt > 1e7:
+                continue  # skip invalids
+
+            tx_type = str(txn.get("type", "expense")).lower()
+            if tx_type in ["income", "credit"]:
+                continue  # skip incomes
+
+            category = str(txn.get("category", "Other")).title()
+            category_summary[category] = category_summary.get(category, 0) + amt
+        except Exception as e:
+            print("⚠️ Summary aggregation error:", e)
+            continue
+
+    # Sorted list for frontend
+    spending_summary = [
+        {"category": k, "total_spent": v}
+        for k, v in sorted(category_summary.items(), key=lambda x: x[1], reverse=True)
+    ]
+
+    print("✅ Spending Summary:", spending_summary)
+
+    # ✅ Sanitizer for JSON serialization (avoids bytes issues)
+    def sanitize(obj):
+        if isinstance(obj, (bytes, Binary)):
+            return obj.decode(errors="ignore")
+        if isinstance(obj, dict):
+            return {k: sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [sanitize(i) for i in obj]
+        return obj
+
+    response = {
+        "name": user.get("name", "User") if user else "User",
+        "transactions": sanitize(transactions),
+        "assets": sanitize(assets),
+        "debts": sanitize(debts),
+        "goals": sanitize(goals),
+        "spending_summary": sanitize(spending_summary)
+    }
+
+    return jsonify(response), 200
+
+
+
+
 
 #1234567890-=
 @app.route("/content", methods=["GET"])
@@ -1184,60 +1504,29 @@ def get_content():
     difficulty = request.args.get("difficulty")
     query = {}
     if difficulty:
-        query["difficulty"] = difficulty
+        query["difficulty"] = difficulty  # match Beginner/Intermediate
 
-    # Fetch with _id included
     contents = list(contents_collection.find(query))
-
-    # Convert ObjectId -> string for JSON
     for c in contents:
         c["_id"] = str(c["_id"])
-
     return jsonify(contents), 200
 
 
-@app.route('/content/<content_id>', methods=['GET'])
-def get_content_by_id(content_id):
-    content_data = {
-        "topic1": {
-            "_id": "topic1",
-            "title": "Introduction to Financial Literacy",
-            "description": "Learn the basics of managing money wisely.",
-            "difficulty": "Beginner",
-            "materials": [
-                {
-                    "type": "video",
-                    "url": "https://www.youtube.com/watch?v=abcd1234"
-                },
-                {
-                    "type": "article",
-                    "text": "Financial literacy helps you make informed decisions about money."
-                }
-            ]
-        },
-        "topic3": {
-            "_id": "topic3",
-            "title": "Understanding Credit Score",
-            "description": "Learn how credit scores work and how to improve them.",
-            "difficulty": "Beginner",
-            "materials": [
-                {
-                    "type": "video",
-                    "url": "https://www.youtube.com/watch?v=1Tt9Sh3RGuk"
-                },
-                {
-                    "type": "article",
-                    "text": "Your credit score determines your loan eligibility. Pay bills on time and manage credit responsibly."
-                }
-            ]
-        }
-    }
 
-    if content_id not in content_data:
-        return jsonify({"error": "Content not found"}), 404
+@app.route("/content/<id>", methods=["GET"])
+def get_content_by_id(id):
+    """Fetch a single topic by its _id."""
+    try:
+        # Try fetching either by ObjectId or string ID (topic1, topic2, etc.)
+        topic = contents_collection.find_one({"_id": id}) or contents_collection.find_one({"_id": ObjectId(id)})
+        if not topic:
+            return jsonify({"error": "Content not found"}), 404
 
-    return jsonify(content_data[content_id]), 200
-
+        topic["_id"] = str(topic["_id"])
+        return jsonify(topic), 200
+    except Exception as e:
+        print("Error:", e)
+        return jsonify({"error": "Invalid ID format"}), 400
 
 
 # ----------------------------
@@ -1246,40 +1535,41 @@ def get_content_by_id(content_id):
 @app.route("/progress", methods=["GET"])
 @jwt_required()
 def get_progress():
-    user_id = get_jwt_identity()  # get user_id from JWT
-    progress = progress_collection.find_one({"user_id": user_id}, {"_id": 0})
-    if progress:
-        return jsonify(progress.get("completed", [])), 200
-    return jsonify([]), 200  # return empty array if no progress
+    user_id = get_jwt_identity()
+    progress = progress_collection.find_one({"user_id": user_id}, {"_id": 0, "completed": 1})
+    if progress and "completed" in progress:
+        return jsonify(progress["completed"]), 200
+    return jsonify([]), 200
 
 
 @app.route("/progress/update", methods=["POST"])
 @jwt_required()
 def update_progress():
-    user_id = get_jwt_identity()
-    data = request.get_json()
-    completed_item = data.get("completed")  # single content ID or object
+    try:
+        user_id = get_jwt_identity()  # Extract user_id from JWT token
+        data = request.get_json()
 
-    if not completed_item:
-        return jsonify({"error": "Missing completed item"}), 400
+        completed_item = data.get("completed")  # The content ID (string)
 
-    progress = progress_collection.find_one({"user_id": user_id})
+        if not completed_item:
+            return jsonify({"error": "Missing 'completed' field"}), 400
 
-    if progress:
-        completed_list = progress.get("completed", [])
-        if completed_item not in completed_list:
-            completed_list.append(completed_item)
+        # Use $addToSet to prevent duplicate entries for the same topic
         progress_collection.update_one(
             {"user_id": user_id},
-            {"$set": {"completed": completed_list}}
+            {"$addToSet": {"completed": completed_item}},
+            upsert=True
         )
-    else:
-        progress_collection.insert_one({
-            "user_id": user_id,
-            "completed": [completed_item]
-        })
 
-    return jsonify({"message": "Progress updated successfully"}), 200
+        return jsonify({
+            "message": f"Progress updated successfully for {completed_item}",
+            "user_id": user_id
+        }), 200
+
+    except Exception as e:
+        print("Error updating progress:", e)
+        return jsonify({"error": "Internal server error"}), 500
+
 
 @app.route("/quiz/<topic_id>", methods=["GET"])
 @jwt_required()
@@ -1287,8 +1577,22 @@ def get_quiz(topic_id):
     quiz = quizzes_collection.find_one({"topic_id": topic_id}, {"_id": 0})
     if not quiz:
         return jsonify({"msg": "Quiz not found"}), 404
-    return jsonify(quiz)
 
+    # Find topic difficulty automatically
+    content = contents_collection.find_one({"_id": topic_id}, {"difficulty": 1, "_id": 0})
+    quiz["difficulty"] = content["difficulty"] if content else "Unknown"
+
+    return jsonify(quiz), 200
+
+@app.route("/quiz", methods=["GET"])
+@jwt_required(optional=True)
+def get_quizzes_by_difficulty():
+    difficulty = request.args.get("difficulty")
+    query = {}
+    if difficulty:
+        query["difficulty"] = difficulty
+    quizzes = list(quizzes_collection.find(query, {"_id": 0}))
+    return jsonify(quizzes), 200
 
 
 @app.route("/quiz/<topic_id>/submit", methods=["POST"])
